@@ -6,7 +6,10 @@
 //! applied when explicitly requested with `mise bootstrap macos-defaults apply`
 //! or `mise bootstrap`.
 
+use std::io::Cursor;
 use std::process::Stdio;
+
+use indexmap::IndexMap;
 
 use crate::result::Result;
 
@@ -34,6 +37,8 @@ pub enum DefaultsValue {
     Int(i64),
     Float(f64),
     Str(String),
+    Dict(IndexMap<String, DefaultsValue>),
+    Array(Vec<DefaultsValue>),
 }
 
 impl DefaultsValue {
@@ -43,18 +48,36 @@ impl DefaultsValue {
             toml::Value::Integer(i) => Some(Self::Int(*i)),
             toml::Value::Float(f) => Some(Self::Float(*f)),
             toml::Value::String(s) => Some(Self::Str(s.clone())),
+            toml::Value::Table(t) => {
+                let mut map = IndexMap::new();
+                for (k, v) in t {
+                    map.insert(k.clone(), Self::from_toml(v)?);
+                }
+                Some(Self::Dict(map))
+            }
+            toml::Value::Array(a) => {
+                let items: Option<Vec<_>> = a.iter().map(Self::from_toml).collect();
+                Some(Self::Array(items?))
+            }
             _ => None,
         }
     }
 
     /// type+value arguments for `defaults write <domain> <key> ...`
-    pub fn write_args(&self) -> Vec<String> {
+    /// Returns `None` for nested values (Dict/Array) which use the
+    /// export/import path instead.
+    pub fn write_args(&self) -> Option<Vec<String>> {
         match self {
-            Self::Bool(b) => vec!["-bool".into(), b.to_string()],
-            Self::Int(i) => vec!["-int".into(), i.to_string()],
-            Self::Float(f) => vec!["-float".into(), f.to_string()],
-            Self::Str(s) => vec!["-string".into(), s.clone()],
+            Self::Bool(b) => Some(vec!["-bool".into(), b.to_string()]),
+            Self::Int(i) => Some(vec!["-int".into(), i.to_string()]),
+            Self::Float(f) => Some(vec!["-float".into(), f.to_string()]),
+            Self::Str(s) => Some(vec!["-string".into(), s.clone()]),
+            Self::Dict(_) | Self::Array(_) => None,
         }
+    }
+
+    pub fn is_nested(&self) -> bool {
+        matches!(self, Self::Dict(_) | Self::Array(_))
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -63,6 +86,14 @@ impl DefaultsValue {
             Self::Int(i) => (*i).into(),
             Self::Float(f) => (*f).into(),
             Self::Str(s) => s.clone().into(),
+            Self::Dict(map) => {
+                let obj: serde_json::Map<String, serde_json::Value> =
+                    map.iter().map(|(k, v)| (k.clone(), v.to_json())).collect();
+                serde_json::Value::Object(obj)
+            }
+            Self::Array(items) => {
+                serde_json::Value::Array(items.iter().map(|v| v.to_json()).collect())
+            }
         }
     }
 
@@ -79,6 +110,7 @@ impl DefaultsValue {
                 read_type == "float" && raw.parse::<f64>().is_ok_and(|v| (v - f).abs() < 1e-9)
             }
             Self::Str(s) => read_type == "string" && raw == s,
+            Self::Dict(_) | Self::Array(_) => false,
         }
     }
 }
@@ -90,7 +122,120 @@ impl std::fmt::Display for DefaultsValue {
             Self::Int(i) => write!(f, "{i}"),
             Self::Float(v) => write!(f, "{v}"),
             Self::Str(s) => write!(f, "{s}"),
+            Self::Dict(_) => write!(f, "{{...}}"),
+            Self::Array(_) => write!(f, "[...]"),
         }
+    }
+}
+
+impl DefaultsValue {
+    pub fn to_plist(&self) -> plist::Value {
+        match self {
+            Self::Bool(b) => plist::Value::Boolean(*b),
+            Self::Int(i) => plist::Value::Integer((*i).into()),
+            Self::Float(f) => plist::Value::Real(*f),
+            Self::Str(s) => plist::Value::String(s.clone()),
+            Self::Dict(map) => {
+                let mut dict = plist::Dictionary::new();
+                for (k, v) in map {
+                    dict.insert(k.clone(), v.to_plist());
+                }
+                plist::Value::Dictionary(dict)
+            }
+            Self::Array(items) => {
+                plist::Value::Array(items.iter().map(|v| v.to_plist()).collect())
+            }
+        }
+    }
+
+    pub fn from_plist(value: &plist::Value) -> Option<Self> {
+        match value {
+            plist::Value::Boolean(b) => Some(Self::Bool(*b)),
+            plist::Value::Integer(i) => i.as_signed().map(Self::Int),
+            plist::Value::Real(f) => Some(Self::Float(*f)),
+            plist::Value::String(s) => Some(Self::Str(s.clone())),
+            plist::Value::Dictionary(dict) => {
+                let mut map = IndexMap::new();
+                for (k, v) in dict {
+                    map.insert(k.clone(), Self::from_plist(v)?);
+                }
+                Some(Self::Dict(map))
+            }
+            plist::Value::Array(items) => {
+                let vals: Option<Vec<_>> = items.iter().map(Self::from_plist).collect();
+                Some(Self::Array(vals?))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn deep_merge_plist(base: &mut plist::Dictionary, overlay: &plist::Dictionary) {
+    for (key, overlay_val) in overlay {
+        match (base.get_mut(key), overlay_val) {
+            (Some(plist::Value::Dictionary(base_dict)), plist::Value::Dictionary(overlay_dict)) => {
+                deep_merge_plist(base_dict, overlay_dict);
+            }
+            _ => {
+                base.insert(key.clone(), overlay_val.clone());
+            }
+        }
+    }
+}
+
+async fn export_domain(domain: &str) -> Result<Option<plist::Dictionary>> {
+    let output = tokio::process::Command::new("defaults")
+        .args(["export", domain, "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("does not exist") {
+            return Ok(None);
+        }
+        eyre::bail!("`defaults export {domain} -` failed: {}", stderr.trim());
+    }
+    match plist::Value::from_reader_xml(Cursor::new(&output.stdout))? {
+        plist::Value::Dictionary(dict) => Ok(Some(dict)),
+        _ => eyre::bail!("`defaults export {domain} -` did not return a dictionary"),
+    }
+}
+
+async fn import_domain(domain: &str, dict: &plist::Dictionary) -> Result<()> {
+    let mut xml = vec![];
+    plist::to_writer_xml(&mut xml, &plist::Value::Dictionary(dict.clone()))?;
+    let mut child = tokio::process::Command::new("defaults")
+        .args(["import", domain, "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        tokio::io::AsyncWriteExt::write_all(&mut stdin, &xml).await?;
+    }
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        eyre::bail!(
+            "`defaults import {domain} -` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Check if declared values are a subset of the current plist.
+/// For dicts, only declared keys are compared (undeclared keys are ignored).
+/// For scalars and arrays, values must match exactly.
+fn plist_contains(current: &plist::Value, declared: &plist::Value) -> bool {
+    match (current, declared) {
+        (plist::Value::Dictionary(cur), plist::Value::Dictionary(decl)) => {
+            decl.iter()
+                .all(|(k, v)| cur.get(k).is_some_and(|cv| plist_contains(cv, v)))
+        }
+        _ => current == declared,
     }
 }
 
@@ -125,23 +270,58 @@ pub fn unavailable_reason() -> String {
 /// Query the current state of each entry. Side-effect free.
 pub async fn status(requests: &[DefaultsRequest]) -> Result<Vec<DefaultsStatus>> {
     let mut out = vec![];
-    for req in requests {
-        let state = match read(&req.domain, &req.key).await? {
-            Some((read_type, raw)) => {
-                if req.value.matches(&read_type, &raw) {
-                    DefaultsState::Set
-                } else {
-                    // call out a type mismatch when the raw value alone
-                    // would look identical to the configured one
-                    let current = if raw == req.value.to_string() {
-                        format!("{raw} ({read_type})")
-                    } else {
-                        raw
-                    };
-                    DefaultsState::Differs { current }
-                }
+
+    let has_nested: IndexMap<&str, bool> = {
+        let mut m = IndexMap::new();
+        for req in requests {
+            let entry = m.entry(req.domain.as_str()).or_insert(false);
+            if req.value.is_nested() {
+                *entry = true;
             }
-            None => DefaultsState::Unset,
+        }
+        m
+    };
+
+    let mut domain_exports: IndexMap<String, Option<plist::Dictionary>> = IndexMap::new();
+    for (domain, nested) in &has_nested {
+        if *nested {
+            domain_exports.insert(domain.to_string(), export_domain(domain).await?);
+        }
+    }
+
+    for req in requests {
+        let state = if has_nested.get(req.domain.as_str()).copied().unwrap_or(false) {
+            let exported = domain_exports.get(&req.domain).and_then(|d| d.as_ref());
+            match exported.and_then(|dict| dict.get(&req.key)) {
+                Some(current_plist) => {
+                    let declared_plist = req.value.to_plist();
+                    if plist_contains(current_plist, &declared_plist) {
+                        DefaultsState::Set
+                    } else {
+                        let current = DefaultsValue::from_plist(current_plist)
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "(unsupported plist type)".to_string());
+                        DefaultsState::Differs { current }
+                    }
+                }
+                None => DefaultsState::Unset,
+            }
+        } else {
+            match read(&req.domain, &req.key).await? {
+                Some((read_type, raw)) => {
+                    if req.value.matches(&read_type, &raw) {
+                        DefaultsState::Set
+                    } else {
+                        let current = if raw == req.value.to_string() {
+                            format!("{raw} ({read_type})")
+                        } else {
+                            raw
+                        };
+                        DefaultsState::Differs { current }
+                    }
+                }
+                None => DefaultsState::Unset,
+            }
         };
         out.push(DefaultsStatus {
             request: req.clone(),
@@ -153,19 +333,39 @@ pub async fn status(requests: &[DefaultsRequest]) -> Result<Vec<DefaultsStatus>>
 
 /// Write the given entries (already filtered to unset/differing ones)
 pub async fn apply(requests: &[DefaultsRequest], dry_run: bool) -> Result<()> {
+    let has_nested: IndexMap<&str, bool> = {
+        let mut m = IndexMap::new();
+        for req in requests {
+            let entry = m.entry(req.domain.as_str()).or_insert(false);
+            if req.value.is_nested() {
+                *entry = true;
+            }
+        }
+        m
+    };
+
+    // Domains with any nested values use export/merge/import
+    let mut nested_domains: IndexMap<String, Vec<&DefaultsRequest>> = IndexMap::new();
+
     for req in requests {
-        let mut args = vec!["write".to_string(), req.domain.clone(), req.key.clone()];
-        args.extend(req.value.write_args());
-        // shell-quoted so the printed command is copy-pasteable even when a
-        // string value contains spaces
-        let display = shell_words::join(&args);
+        if has_nested.get(req.domain.as_str()).copied().unwrap_or(false) {
+            nested_domains
+                .entry(req.domain.clone())
+                .or_default()
+                .push(req);
+            continue;
+        }
+        let args = req.value.write_args().expect("scalar value has write_args");
+        let mut cmd_args = vec!["write".to_string(), req.domain.clone(), req.key.clone()];
+        cmd_args.extend(args);
+        let display = shell_words::join(&cmd_args);
         if dry_run {
             miseprintln!("defaults {display}");
             continue;
         }
         debug!("$ defaults {display}");
         let output = tokio::process::Command::new("defaults")
-            .args(&args)
+            .args(&cmd_args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -177,6 +377,31 @@ pub async fn apply(requests: &[DefaultsRequest], dry_run: bool) -> Result<()> {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
+    }
+
+    for (domain, reqs) in &nested_domains {
+        let mut dict = export_domain(domain).await?.unwrap_or_default();
+        for req in reqs {
+            let plist_val = req.value.to_plist();
+            match (&plist_val, dict.get_mut(&req.key)) {
+                (
+                    plist::Value::Dictionary(overlay),
+                    Some(plist::Value::Dictionary(existing)),
+                ) => {
+                    deep_merge_plist(existing, overlay);
+                }
+                _ => {
+                    dict.insert(req.key.clone(), plist_val);
+                }
+            }
+        }
+        if dry_run {
+            let keys: Vec<_> = reqs.iter().map(|r| format!("{} = {}", r.key, r.value)).collect();
+            miseprintln!("defaults import {domain} (merge {})", keys.join(", "));
+            continue;
+        }
+        debug!("$ defaults import {domain} -");
+        import_domain(domain, &dict).await?;
     }
     Ok(())
 }
@@ -255,21 +480,71 @@ mod tests {
             Some(DefaultsValue::Str("right".into()))
         );
 
-        // unsupported plist shapes are None -> warned + skipped by the caller
-        assert_eq!(DefaultsValue::from_toml(&val("[1, 2]")), None);
-        assert_eq!(DefaultsValue::from_toml(&val("{ a = 1 }")), None);
+        assert_eq!(
+            DefaultsValue::from_toml(&val("[1, 2]")),
+            Some(DefaultsValue::Array(vec![
+                DefaultsValue::Int(1),
+                DefaultsValue::Int(2),
+            ]))
+        );
+        assert_eq!(
+            DefaultsValue::from_toml(&val("{ a = 1 }")),
+            Some(DefaultsValue::Dict(IndexMap::from([(
+                "a".to_string(),
+                DefaultsValue::Int(1),
+            )])))
+        );
+    }
+
+    #[test]
+    fn test_from_toml_nested() {
+        let toml: toml::Value = toml::from_str(
+            r#"
+            [inner]
+            enabled = false
+            "#,
+        )
+        .unwrap();
+        let val = DefaultsValue::from_toml(&toml).unwrap();
+        assert_eq!(
+            val,
+            DefaultsValue::Dict(IndexMap::from([(
+                "inner".to_string(),
+                DefaultsValue::Dict(IndexMap::from([(
+                    "enabled".to_string(),
+                    DefaultsValue::Bool(false),
+                )])),
+            )]))
+        );
     }
 
     #[test]
     fn test_write_args() {
-        assert_eq!(DefaultsValue::Bool(true).write_args(), ["-bool", "true"]);
-        assert_eq!(DefaultsValue::Bool(false).write_args(), ["-bool", "false"]);
-        assert_eq!(DefaultsValue::Int(2).write_args(), ["-int", "2"]);
-        assert_eq!(DefaultsValue::Float(0.5).write_args(), ["-float", "0.5"]);
+        assert_eq!(
+            DefaultsValue::Bool(true).write_args(),
+            Some(vec!["-bool".to_string(), "true".to_string()])
+        );
+        assert_eq!(
+            DefaultsValue::Bool(false).write_args(),
+            Some(vec!["-bool".to_string(), "false".to_string()])
+        );
+        assert_eq!(
+            DefaultsValue::Int(2).write_args(),
+            Some(vec!["-int".to_string(), "2".to_string()])
+        );
+        assert_eq!(
+            DefaultsValue::Float(0.5).write_args(),
+            Some(vec!["-float".to_string(), "0.5".to_string()])
+        );
         assert_eq!(
             DefaultsValue::Str("left".into()).write_args(),
-            ["-string", "left"]
+            Some(vec!["-string".to_string(), "left".to_string()])
         );
+        assert_eq!(
+            DefaultsValue::Dict(IndexMap::new()).write_args(),
+            None
+        );
+        assert_eq!(DefaultsValue::Array(vec![]).write_args(), None);
     }
 
     #[test]
@@ -292,5 +567,67 @@ mod tests {
 
         assert!(DefaultsValue::Str("left".into()).matches("string", "left"));
         assert!(!DefaultsValue::Str("left".into()).matches("string", "right"));
+
+        // nested values always return false (use plist path)
+        assert!(!DefaultsValue::Dict(IndexMap::new()).matches("dictionary", "{}"));
+    }
+
+    #[test]
+    fn test_plist_round_trip() {
+        let val = DefaultsValue::Dict(IndexMap::from([
+            ("enabled".to_string(), DefaultsValue::Bool(false)),
+            (
+                "value".to_string(),
+                DefaultsValue::Dict(IndexMap::from([
+                    (
+                        "parameters".to_string(),
+                        DefaultsValue::Array(vec![
+                            DefaultsValue::Int(32),
+                            DefaultsValue::Int(49),
+                            DefaultsValue::Int(262144),
+                        ]),
+                    ),
+                    ("type".to_string(), DefaultsValue::Str("standard".into())),
+                ])),
+            ),
+        ]));
+        let plist_val = val.to_plist();
+        let round_tripped = DefaultsValue::from_plist(&plist_val).unwrap();
+        assert_eq!(val, round_tripped);
+    }
+
+    #[test]
+    fn test_deep_merge_plist() {
+        let mut base = plist::Dictionary::new();
+        base.insert("keep".into(), plist::Value::String("original".into()));
+        let mut inner = plist::Dictionary::new();
+        inner.insert("a".into(), plist::Value::Integer(1.into()));
+        inner.insert("b".into(), plist::Value::Integer(2.into()));
+        base.insert("nested".into(), plist::Value::Dictionary(inner));
+
+        let mut overlay = plist::Dictionary::new();
+        overlay.insert("new_key".into(), plist::Value::Boolean(true));
+        let mut inner_overlay = plist::Dictionary::new();
+        inner_overlay.insert("b".into(), plist::Value::Integer(99.into()));
+        inner_overlay.insert("c".into(), plist::Value::Integer(3.into()));
+        overlay.insert("nested".into(), plist::Value::Dictionary(inner_overlay));
+
+        deep_merge_plist(&mut base, &overlay);
+
+        // preserves unmentioned keys
+        assert_eq!(
+            base.get("keep"),
+            Some(&plist::Value::String("original".into()))
+        );
+        // adds new keys
+        assert_eq!(base.get("new_key"), Some(&plist::Value::Boolean(true)));
+        // recurses into nested dicts
+        let nested = match base.get("nested") {
+            Some(plist::Value::Dictionary(d)) => d,
+            _ => panic!("expected dict"),
+        };
+        assert_eq!(nested.get("a"), Some(&plist::Value::Integer(1.into()))); // preserved
+        assert_eq!(nested.get("b"), Some(&plist::Value::Integer(99.into()))); // replaced
+        assert_eq!(nested.get("c"), Some(&plist::Value::Integer(3.into()))); // added
     }
 }
