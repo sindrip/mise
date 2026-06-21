@@ -65,13 +65,21 @@ impl std::fmt::Display for DefaultsRequest {
 }
 
 /// Convert a TOML value to a plist value via serde.
-/// Returns `None` for TOML datetimes (no plist equivalent).
+/// Returns `None` for TOML datetimes.
 pub fn toml_to_plist(value: &toml::Value) -> Option<PlistValue> {
-    if matches!(value, toml::Value::Datetime(_)) {
+    if contains_datetime(value) {
         return None;
     }
-    let json = serde_json::to_value(value).ok()?;
-    serde_json::from_value(json).ok()
+    plist::to_value(value).ok().map(PlistValue)
+}
+
+fn contains_datetime(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Datetime(_) => true,
+        toml::Value::Array(values) => values.iter().any(contains_datetime),
+        toml::Value::Table(table) => table.values().any(contains_datetime),
+        _ => false,
+    }
 }
 
 fn deep_merge_plist(base: &mut plist::Dictionary, overlay: &plist::Dictionary) {
@@ -312,6 +320,15 @@ mod tests {
     }
 
     #[test]
+    fn test_toml_to_plist_rejects_nested_datetime() {
+        assert_eq!(
+            toml_to_plist(&val("{ updated_at = 2024-01-01T00:00:00Z }")),
+            None
+        );
+        assert_eq!(toml_to_plist(&val("[2024-01-01T00:00:00Z]")), None);
+    }
+
+    #[test]
     fn test_deep_merge_plist() {
         let mut base = plist::Dictionary::new();
         base.insert("keep".into(), plist::Value::String("original".into()));
@@ -376,7 +393,7 @@ mod tests {
                 prop_assert!(toml_to_plist(&v).is_some());
             }
 
-            /// the serde bridge preserves values: serializing toml and the
+            /// the plist serde bridge preserves values: serializing toml and the
             /// resulting plist to JSON produces identical output
             #[test]
             fn toml_plist_json_round_trip(v in arb_toml_value()) {
