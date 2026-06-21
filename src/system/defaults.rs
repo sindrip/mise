@@ -19,118 +19,41 @@ pub struct DefaultsRequest {
     /// preferences domain, e.g. "com.apple.dock" or "NSGlobalDomain"
     pub domain: String,
     pub key: String,
-    pub value: DefaultsValue,
+    pub value: plist::Value,
 }
 
 impl std::fmt::Display for DefaultsRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {} = {}", self.domain, self.key, self.value)
+        write!(f, "{} {} = {}", self.domain, self.key, display_plist(&self.value))
     }
 }
 
-/// Supported TOML value types. Maps to plist types for export/import.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DefaultsValue {
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    Str(String),
-    Dict(IndexMap<String, DefaultsValue>),
-    Array(Vec<DefaultsValue>),
+/// Convert a TOML value to a plist value via serde.
+/// Returns `None` for TOML datetimes (no plist equivalent).
+pub fn toml_to_plist(value: &toml::Value) -> Option<plist::Value> {
+    if matches!(value, toml::Value::Datetime(_)) {
+        return None;
+    }
+    let json = serde_json::to_value(value).ok()?;
+    serde_json::from_value(json).ok()
 }
 
-impl DefaultsValue {
-    pub fn from_toml(value: &toml::Value) -> Option<Self> {
-        match value {
-            toml::Value::Boolean(b) => Some(Self::Bool(*b)),
-            toml::Value::Integer(i) => Some(Self::Int(*i)),
-            toml::Value::Float(f) => Some(Self::Float(*f)),
-            toml::Value::String(s) => Some(Self::Str(s.clone())),
-            toml::Value::Table(t) => {
-                let mut map = IndexMap::new();
-                for (k, v) in t {
-                    map.insert(k.clone(), Self::from_toml(v)?);
-                }
-                Some(Self::Dict(map))
-            }
-            toml::Value::Array(a) => {
-                let items: Option<Vec<_>> = a.iter().map(Self::from_toml).collect();
-                Some(Self::Array(items?))
-            }
-            _ => None,
-        }
-    }
-
-    pub fn to_json(&self) -> serde_json::Value {
-        match self {
-            Self::Bool(b) => (*b).into(),
-            Self::Int(i) => (*i).into(),
-            Self::Float(f) => (*f).into(),
-            Self::Str(s) => s.clone().into(),
-            Self::Dict(map) => {
-                let obj: serde_json::Map<String, serde_json::Value> =
-                    map.iter().map(|(k, v)| (k.clone(), v.to_json())).collect();
-                serde_json::Value::Object(obj)
-            }
-            Self::Array(items) => {
-                serde_json::Value::Array(items.iter().map(|v| v.to_json()).collect())
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for DefaultsValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Bool(b) => write!(f, "{b}"),
-            Self::Int(i) => write!(f, "{i}"),
-            Self::Float(v) => write!(f, "{v}"),
-            Self::Str(s) => write!(f, "{s}"),
-            Self::Dict(_) => write!(f, "{{...}}"),
-            Self::Array(_) => write!(f, "[...]"),
-        }
-    }
-}
-
-impl DefaultsValue {
-    pub fn to_plist(&self) -> plist::Value {
-        match self {
-            Self::Bool(b) => plist::Value::Boolean(*b),
-            Self::Int(i) => plist::Value::Integer((*i).into()),
-            Self::Float(f) => plist::Value::Real(*f),
-            Self::Str(s) => plist::Value::String(s.clone()),
-            Self::Dict(map) => {
-                let mut dict = plist::Dictionary::new();
-                for (k, v) in map {
-                    dict.insert(k.clone(), v.to_plist());
-                }
-                plist::Value::Dictionary(dict)
-            }
-            Self::Array(items) => {
-                plist::Value::Array(items.iter().map(|v| v.to_plist()).collect())
-            }
-        }
-    }
-
-    pub fn from_plist(value: &plist::Value) -> Option<Self> {
-        match value {
-            plist::Value::Boolean(b) => Some(Self::Bool(*b)),
-            plist::Value::Integer(i) => i.as_signed().map(Self::Int),
-            plist::Value::Real(f) => Some(Self::Float(*f)),
-            plist::Value::String(s) => Some(Self::Str(s.clone())),
-            plist::Value::Dictionary(dict) => {
-                let mut map = IndexMap::new();
-                for (k, v) in dict {
-                    map.insert(k.clone(), Self::from_plist(v)?);
-                }
-                Some(Self::Dict(map))
-            }
-            plist::Value::Array(items) => {
-                let vals: Option<Vec<_>> = items.iter().map(Self::from_plist).collect();
-                Some(Self::Array(vals?))
-            }
-            _ => None,
-        }
+/// Compact display of a plist value for status tables.
+pub fn display_plist(value: &plist::Value) -> String {
+    match value {
+        plist::Value::Boolean(b) => b.to_string(),
+        plist::Value::Integer(i) => i
+            .as_signed()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| i.as_unsigned().unwrap().to_string()),
+        plist::Value::Real(f) => f.to_string(),
+        plist::Value::String(s) => s.clone(),
+        plist::Value::Dictionary(_) => "{...}".to_string(),
+        plist::Value::Array(_) => "[...]".to_string(),
+        plist::Value::Data(_) => "(data)".to_string(),
+        plist::Value::Date(_) => "(date)".to_string(),
+        plist::Value::Uid(_) => "(uid)".to_string(),
+        _ => "(unknown)".to_string(),
     }
 }
 
@@ -246,14 +169,12 @@ pub async fn status(requests: &[DefaultsRequest]) -> Result<Vec<DefaultsStatus>>
         let exported = domain_exports.get(&req.domain).and_then(|d| d.as_ref());
         let state = match exported.and_then(|dict| dict.get(&req.key)) {
             Some(current_plist) => {
-                let declared_plist = req.value.to_plist();
-                if plist_contains(current_plist, &declared_plist) {
+                if plist_contains(current_plist, &req.value) {
                     DefaultsState::Set
                 } else {
-                    let current = DefaultsValue::from_plist(current_plist)
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "(unsupported plist type)".to_string());
-                    DefaultsState::Differs { current }
+                    DefaultsState::Differs {
+                        current: display_plist(current_plist),
+                    }
                 }
             }
             None => DefaultsState::Unset,
@@ -275,14 +196,16 @@ pub async fn apply(requests: &[DefaultsRequest], dry_run: bool) -> Result<()> {
 
     for (domain, reqs) in &by_domain {
         if dry_run {
-            let keys: Vec<_> = reqs.iter().map(|r| format!("{} = {}", r.key, r.value)).collect();
+            let keys: Vec<_> = reqs
+                .iter()
+                .map(|r| format!("{} = {}", r.key, display_plist(&r.value)))
+                .collect();
             miseprintln!("defaults import {domain} (merge {})", keys.join(", "));
             continue;
         }
         let mut dict = export_domain(domain).await?.unwrap_or_default();
         for req in reqs {
-            let plist_val = req.value.to_plist();
-            match (&plist_val, dict.get_mut(&req.key)) {
+            match (&req.value, dict.get_mut(&req.key)) {
                 (
                     plist::Value::Dictionary(overlay),
                     Some(plist::Value::Dictionary(existing)),
@@ -290,7 +213,7 @@ pub async fn apply(requests: &[DefaultsRequest], dry_run: bool) -> Result<()> {
                     deep_merge_plist(existing, overlay);
                 }
                 _ => {
-                    dict.insert(req.key.clone(), plist_val);
+                    dict.insert(req.key.clone(), req.value.clone());
                 }
             }
         }
@@ -309,42 +232,41 @@ mod tests {
     }
 
     #[test]
-    fn test_from_toml() {
+    fn test_toml_to_plist() {
         assert_eq!(
-            DefaultsValue::from_toml(&val("true")),
-            Some(DefaultsValue::Bool(true))
+            toml_to_plist(&val("true")),
+            Some(plist::Value::Boolean(true))
         );
         assert_eq!(
-            DefaultsValue::from_toml(&val("48")),
-            Some(DefaultsValue::Int(48))
+            toml_to_plist(&val("48")),
+            Some(plist::Value::Integer(48.into()))
         );
         assert_eq!(
-            DefaultsValue::from_toml(&val("1.5")),
-            Some(DefaultsValue::Float(1.5))
+            toml_to_plist(&val("1.5")),
+            Some(plist::Value::Real(1.5))
         );
         assert_eq!(
-            DefaultsValue::from_toml(&val(r#""right""#)),
-            Some(DefaultsValue::Str("right".into()))
+            toml_to_plist(&val(r#""right""#)),
+            Some(plist::Value::String("right".into()))
         );
-
         assert_eq!(
-            DefaultsValue::from_toml(&val("[1, 2]")),
-            Some(DefaultsValue::Array(vec![
-                DefaultsValue::Int(1),
-                DefaultsValue::Int(2),
+            toml_to_plist(&val("[1, 2]")),
+            Some(plist::Value::Array(vec![
+                plist::Value::Integer(1.into()),
+                plist::Value::Integer(2.into()),
             ]))
         );
-        assert_eq!(
-            DefaultsValue::from_toml(&val("{ a = 1 }")),
-            Some(DefaultsValue::Dict(IndexMap::from([(
-                "a".to_string(),
-                DefaultsValue::Int(1),
-            )])))
-        );
+
+        let dict = toml_to_plist(&val("{ a = 1 }")).unwrap();
+        let inner = match &dict {
+            plist::Value::Dictionary(d) => d,
+            _ => panic!("expected dict"),
+        };
+        assert_eq!(inner.get("a"), Some(&plist::Value::Integer(1.into())));
     }
 
     #[test]
-    fn test_from_toml_nested() {
+    fn test_toml_to_plist_nested() {
         let toml: toml::Value = toml::from_str(
             r#"
             [inner]
@@ -352,41 +274,21 @@ mod tests {
             "#,
         )
         .unwrap();
-        let val = DefaultsValue::from_toml(&toml).unwrap();
-        assert_eq!(
-            val,
-            DefaultsValue::Dict(IndexMap::from([(
-                "inner".to_string(),
-                DefaultsValue::Dict(IndexMap::from([(
-                    "enabled".to_string(),
-                    DefaultsValue::Bool(false),
-                )])),
-            )]))
-        );
+        let val = toml_to_plist(&toml).unwrap();
+        let outer = match &val {
+            plist::Value::Dictionary(d) => d,
+            _ => panic!("expected dict"),
+        };
+        let inner = match outer.get("inner") {
+            Some(plist::Value::Dictionary(d)) => d,
+            _ => panic!("expected inner dict"),
+        };
+        assert_eq!(inner.get("enabled"), Some(&plist::Value::Boolean(false)));
     }
 
     #[test]
-    fn test_plist_round_trip() {
-        let val = DefaultsValue::Dict(IndexMap::from([
-            ("enabled".to_string(), DefaultsValue::Bool(false)),
-            (
-                "value".to_string(),
-                DefaultsValue::Dict(IndexMap::from([
-                    (
-                        "parameters".to_string(),
-                        DefaultsValue::Array(vec![
-                            DefaultsValue::Int(32),
-                            DefaultsValue::Int(49),
-                            DefaultsValue::Int(262144),
-                        ]),
-                    ),
-                    ("type".to_string(), DefaultsValue::Str("standard".into())),
-                ])),
-            ),
-        ]));
-        let plist_val = val.to_plist();
-        let round_tripped = DefaultsValue::from_plist(&plist_val).unwrap();
-        assert_eq!(val, round_tripped);
+    fn test_toml_to_plist_rejects_datetime() {
+        assert_eq!(toml_to_plist(&val("2024-01-01T00:00:00Z")), None);
     }
 
     #[test]

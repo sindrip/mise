@@ -10,7 +10,7 @@ use super::system::{install, status, upgrade, r#use};
 use crate::config::{self, Config, Settings};
 use crate::dirs;
 use crate::system;
-use crate::system::defaults::DefaultsState;
+use crate::system::defaults::{DefaultsState, display_plist};
 use crate::system::files::{FileMode, FileRequest};
 use crate::system::hooks::{self, BootstrapHookPhase};
 use crate::system::launchd::LaunchdState;
@@ -817,7 +817,7 @@ impl BootstrapMacosDefaultsStatus {
                         rows.push(vec![
                             req.domain.clone(),
                             req.key.clone(),
-                            req.value.to_string(),
+                            display_plist(&req.value),
                             "".to_string(),
                             format!("skipped ({reason})"),
                         ]);
@@ -828,7 +828,7 @@ impl BootstrapMacosDefaultsStatus {
                 let mut json_entries = vec![];
                 for s in statuses {
                     let (current, state) = match &s.state {
-                        DefaultsState::Set => (s.request.value.to_string(), "set"),
+                        DefaultsState::Set => (display_plist(&s.request.value), "set"),
                         DefaultsState::Differs { current } => {
                             any_missing = true;
                             (current.clone(), "differs")
@@ -842,7 +842,7 @@ impl BootstrapMacosDefaultsStatus {
                         json_entries.push(json!({
                             "domain": s.request.domain,
                             "key": s.request.key,
-                            "value": s.request.value.to_json(),
+                            "value": serde_json::to_value(&s.request.value).unwrap_or_default(),
                             "current": current,
                             "state": state,
                         }));
@@ -850,7 +850,7 @@ impl BootstrapMacosDefaultsStatus {
                         rows.push(vec![
                             s.request.domain.clone(),
                             s.request.key.clone(),
-                            s.request.value.to_string(),
+                            display_plist(&s.request.value),
                             current,
                             state.to_string(),
                         ]);

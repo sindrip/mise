@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::config::{Config, ConfigMap};
-use crate::system::defaults::{DefaultsRequest, DefaultsValue};
+use crate::system::defaults::{DefaultsRequest, toml_to_plist};
 use crate::system::launchd::{LaunchdRequest, LaunchdTomlConfig};
 use crate::system::packages::{PackageRequest, SystemPackageManager};
 use crate::system::systemd::{SystemdRequest, SystemdTomlConfig};
@@ -307,7 +307,7 @@ pub fn defaults_from_config(config: &Config) -> Vec<DefaultsRequest> {
     }
     let mut out = vec![];
     for ((domain, key), value) in merged {
-        match DefaultsValue::from_toml(&value) {
+        match toml_to_plist(&value) {
             Some(value) => out.push(DefaultsRequest { domain, key, value }),
             None => warn!(
                 "[bootstrap.macos.defaults]: unsupported TOML type for {domain} {key} (datetime)"
