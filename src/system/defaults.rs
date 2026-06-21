@@ -15,7 +15,7 @@ use indexmap::IndexMap;
 use crate::result::Result;
 
 /// Newtype around `plist::Value` so we can implement `Display`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct PlistValue(pub plist::Value);
 
@@ -71,7 +71,7 @@ pub fn toml_to_plist(value: &toml::Value) -> Option<PlistValue> {
         return None;
     }
     let json = serde_json::to_value(value).ok()?;
-    serde_json::from_value(json).map(PlistValue).ok()
+    serde_json::from_value(json).ok()
 }
 
 fn deep_merge_plist(base: &mut plist::Dictionary, overlay: &plist::Dictionary) {
