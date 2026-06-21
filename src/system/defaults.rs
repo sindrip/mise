@@ -325,4 +325,64 @@ mod tests {
         assert_eq!(nested.get("b"), Some(&plist::Value::Integer(99.into()))); // replaced
         assert_eq!(nested.get("c"), Some(&plist::Value::Integer(3.into()))); // added
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Generate arbitrary toml::Value trees (no Datetime)
+        fn arb_toml_value() -> impl Strategy<Value = toml::Value> {
+            let leaf = prop_oneof![
+                any::<bool>().prop_map(toml::Value::Boolean),
+                any::<i64>().prop_map(toml::Value::Integer),
+                // avoid NaN/Inf — not representable in JSON or plist
+                (-1e10f64..1e10f64).prop_map(toml::Value::Float),
+                "[a-z]{0,8}".prop_map(|s| toml::Value::String(s)),
+            ];
+            leaf.prop_recursive(3, 16, 4, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 0..4)
+                        .prop_map(toml::Value::Array),
+                    prop::collection::btree_map("[a-z]{1,4}", inner, 0..4)
+                        .prop_map(|m| toml::Value::Table(m.into_iter().collect())),
+                ]
+            })
+        }
+
+        proptest! {
+            /// toml_to_plist always succeeds for non-datetime values
+            #[test]
+            fn toml_to_plist_never_fails(v in arb_toml_value()) {
+                prop_assert!(toml_to_plist(&v).is_some());
+            }
+
+            /// the serde bridge preserves values: serializing toml and the
+            /// resulting plist to JSON produces identical output
+            #[test]
+            fn toml_plist_json_round_trip(v in arb_toml_value()) {
+                let plist_val = toml_to_plist(&v).unwrap();
+                let json_from_toml = serde_json::to_value(&v).unwrap();
+                let json_from_plist = serde_json::to_value(&plist_val).unwrap();
+                prop_assert_eq!(json_from_toml, json_from_plist);
+            }
+
+            /// plist_contains is reflexive: a value always contains itself
+            #[test]
+            fn plist_contains_reflexive(v in arb_toml_value()) {
+                let plist_val = toml_to_plist(&v).unwrap();
+                prop_assert!(plist_contains(&plist_val, &plist_val));
+            }
+
+            /// a dict merged with itself is unchanged
+            #[test]
+            fn deep_merge_idempotent(v in arb_toml_value()) {
+                let plist_val = toml_to_plist(&v).unwrap();
+                if let plist::Value::Dictionary(dict) = &plist_val {
+                    let mut base = dict.clone();
+                    deep_merge_plist(&mut base, dict);
+                    prop_assert_eq!(&base, dict);
+                }
+            }
+        }
+    }
 }
