@@ -310,8 +310,7 @@ pub fn defaults_from_config(config: &Config) -> Vec<DefaultsRequest> {
         match DefaultsValue::from_toml(&value) {
             Some(value) => out.push(DefaultsRequest { domain, key, value }),
             None => warn!(
-                "[bootstrap.macos.defaults]: unsupported value type for {domain} {key} \
-                 (expected bool, integer, float, string, table, or array)"
+                "[bootstrap.macos.defaults]: unsupported TOML type for {domain} {key} (datetime)"
             ),
         }
     }

@@ -39,13 +39,17 @@ fi
 # dry-run never writes anything
 assert_succeed "mise bootstrap macos-defaults apply --dry-run --yes"
 
-# unsupported value types warn but don't fail
+# nested dicts and arrays are accepted
 cat <<EOF >mise.toml
-[bootstrap.macos.defaults]
-"com.apple.dock" = { future-array = [1, 2] }
+[bootstrap.macos.defaults."com.apple.symbolichotkeys"]
+AppleSymbolicHotKeys = { "60" = { enabled = false } }
+
+[bootstrap.macos.defaults."com.apple.dock"]
+future-array = [1, 2]
 EOF
 assert_succeed "mise bootstrap macos-defaults status"
-assert_contains "mise bootstrap macos-defaults status 2>&1" "unsupported value type"
+assert_contains "mise bootstrap macos-defaults status" "AppleSymbolicHotKeys"
+assert_contains "mise bootstrap macos-defaults status" "future-array"
 
 # a domain entry that isn't a table warns but doesn't fail
 cat <<EOF >mise.toml

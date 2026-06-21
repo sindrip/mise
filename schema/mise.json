@@ -3234,9 +3234,15 @@
                     },
                     {
                       "type": "string"
+                    },
+                    {
+                      "type": "object"
+                    },
+                    {
+                      "type": "array"
                     }
                   ],
-                  "description": "desired value, written with the matching `defaults write` type (-bool, -int, -float, -string)"
+                  "description": "desired value (scalar, dict, or array) applied via defaults export/import"
                 }
               }
             },
