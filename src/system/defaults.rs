@@ -7,11 +7,47 @@
 //! `mise bootstrap macos-defaults apply` or `mise bootstrap`.
 
 use std::io::Cursor;
+use std::ops::Deref;
 use std::process::Stdio;
 
 use indexmap::IndexMap;
 
 use crate::result::Result;
+
+/// Newtype around `plist::Value` so we can implement `Display`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(transparent)]
+pub struct PlistValue(pub plist::Value);
+
+impl Deref for PlistValue {
+    type Target = plist::Value;
+    fn deref(&self) -> &plist::Value {
+        &self.0
+    }
+}
+
+impl From<plist::Value> for PlistValue {
+    fn from(v: plist::Value) -> Self {
+        Self(v)
+    }
+}
+
+impl std::fmt::Display for PlistValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            plist::Value::Boolean(b) => write!(f, "{b}"),
+            plist::Value::Integer(i) => match i.as_signed() {
+                Some(v) => write!(f, "{v}"),
+                None => write!(f, "{}", i.as_unsigned().unwrap()),
+            },
+            plist::Value::Real(v) => write!(f, "{v}"),
+            plist::Value::String(s) => write!(f, "{s}"),
+            plist::Value::Dictionary(_) => write!(f, "{{...}}"),
+            plist::Value::Array(_) => write!(f, "[...]"),
+            _ => write!(f, "(unsupported)"),
+        }
+    }
+}
 
 /// A single `[bootstrap.macos.defaults.<domain>]` entry: `key = value`
 #[derive(Debug, Clone, PartialEq)]
@@ -19,42 +55,23 @@ pub struct DefaultsRequest {
     /// preferences domain, e.g. "com.apple.dock" or "NSGlobalDomain"
     pub domain: String,
     pub key: String,
-    pub value: plist::Value,
+    pub value: PlistValue,
 }
 
 impl std::fmt::Display for DefaultsRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {} = {}", self.domain, self.key, display_plist(&self.value))
+        write!(f, "{} {} = {}", self.domain, self.key, self.value)
     }
 }
 
 /// Convert a TOML value to a plist value via serde.
 /// Returns `None` for TOML datetimes (no plist equivalent).
-pub fn toml_to_plist(value: &toml::Value) -> Option<plist::Value> {
+pub fn toml_to_plist(value: &toml::Value) -> Option<PlistValue> {
     if matches!(value, toml::Value::Datetime(_)) {
         return None;
     }
     let json = serde_json::to_value(value).ok()?;
-    serde_json::from_value(json).ok()
-}
-
-/// Compact display of a plist value for status tables.
-pub fn display_plist(value: &plist::Value) -> String {
-    match value {
-        plist::Value::Boolean(b) => b.to_string(),
-        plist::Value::Integer(i) => i
-            .as_signed()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| i.as_unsigned().unwrap().to_string()),
-        plist::Value::Real(f) => f.to_string(),
-        plist::Value::String(s) => s.clone(),
-        plist::Value::Dictionary(_) => "{...}".to_string(),
-        plist::Value::Array(_) => "[...]".to_string(),
-        plist::Value::Data(_) => "(data)".to_string(),
-        plist::Value::Date(_) => "(date)".to_string(),
-        plist::Value::Uid(_) => "(uid)".to_string(),
-        _ => "(unknown)".to_string(),
-    }
+    serde_json::from_value(json).map(PlistValue).ok()
 }
 
 fn deep_merge_plist(base: &mut plist::Dictionary, overlay: &plist::Dictionary) {
@@ -173,7 +190,7 @@ pub async fn status(requests: &[DefaultsRequest]) -> Result<Vec<DefaultsStatus>>
                     DefaultsState::Set
                 } else {
                     DefaultsState::Differs {
-                        current: display_plist(current_plist),
+                        current: PlistValue(current_plist.clone()).to_string(),
                     }
                 }
             }
@@ -198,14 +215,14 @@ pub async fn apply(requests: &[DefaultsRequest], dry_run: bool) -> Result<()> {
         if dry_run {
             let keys: Vec<_> = reqs
                 .iter()
-                .map(|r| format!("{} = {}", r.key, display_plist(&r.value)))
+                .map(|r| format!("{} = {}", r.key, r.value))
                 .collect();
             miseprintln!("defaults import {domain} (merge {})", keys.join(", "));
             continue;
         }
         let mut dict = export_domain(domain).await?.unwrap_or_default();
         for req in reqs {
-            match (&req.value, dict.get_mut(&req.key)) {
+            match (&req.value.0, dict.get_mut(&req.key)) {
                 (
                     plist::Value::Dictionary(overlay),
                     Some(plist::Value::Dictionary(existing)),
@@ -213,7 +230,7 @@ pub async fn apply(requests: &[DefaultsRequest], dry_run: bool) -> Result<()> {
                     deep_merge_plist(existing, overlay);
                 }
                 _ => {
-                    dict.insert(req.key.clone(), req.value.clone());
+                    dict.insert(req.key.clone(), req.value.0.clone());
                 }
             }
         }
@@ -235,30 +252,33 @@ mod tests {
     fn test_toml_to_plist() {
         assert_eq!(
             toml_to_plist(&val("true")),
-            Some(plist::Value::Boolean(true))
+            Some(plist::Value::Boolean(true).into())
         );
         assert_eq!(
             toml_to_plist(&val("48")),
-            Some(plist::Value::Integer(48.into()))
+            Some(plist::Value::Integer(48.into()).into())
         );
         assert_eq!(
             toml_to_plist(&val("1.5")),
-            Some(plist::Value::Real(1.5))
+            Some(plist::Value::Real(1.5).into())
         );
         assert_eq!(
             toml_to_plist(&val(r#""right""#)),
-            Some(plist::Value::String("right".into()))
+            Some(plist::Value::String("right".into()).into())
         );
         assert_eq!(
             toml_to_plist(&val("[1, 2]")),
-            Some(plist::Value::Array(vec![
-                plist::Value::Integer(1.into()),
-                plist::Value::Integer(2.into()),
-            ]))
+            Some(
+                plist::Value::Array(vec![
+                    plist::Value::Integer(1.into()),
+                    plist::Value::Integer(2.into()),
+                ])
+                .into()
+            )
         );
 
-        let dict = toml_to_plist(&val("{ a = 1 }")).unwrap();
-        let inner = match &dict {
+        let pv = toml_to_plist(&val("{ a = 1 }")).unwrap();
+        let inner = match &*pv {
             plist::Value::Dictionary(d) => d,
             _ => panic!("expected dict"),
         };
@@ -274,8 +294,8 @@ mod tests {
             "#,
         )
         .unwrap();
-        let val = toml_to_plist(&toml).unwrap();
-        let outer = match &val {
+        let pv = toml_to_plist(&toml).unwrap();
+        let outer = match &*pv {
             plist::Value::Dictionary(d) => d,
             _ => panic!("expected dict"),
         };
@@ -360,24 +380,24 @@ mod tests {
             /// resulting plist to JSON produces identical output
             #[test]
             fn toml_plist_json_round_trip(v in arb_toml_value()) {
-                let plist_val = toml_to_plist(&v).unwrap();
+                let pv = toml_to_plist(&v).unwrap();
                 let json_from_toml = serde_json::to_value(&v).unwrap();
-                let json_from_plist = serde_json::to_value(&plist_val).unwrap();
+                let json_from_plist = serde_json::to_value(&*pv).unwrap();
                 prop_assert_eq!(json_from_toml, json_from_plist);
             }
 
             /// plist_contains is reflexive: a value always contains itself
             #[test]
             fn plist_contains_reflexive(v in arb_toml_value()) {
-                let plist_val = toml_to_plist(&v).unwrap();
-                prop_assert!(plist_contains(&plist_val, &plist_val));
+                let pv = toml_to_plist(&v).unwrap();
+                prop_assert!(plist_contains(&pv, &pv));
             }
 
             /// a dict merged with itself is unchanged
             #[test]
             fn deep_merge_idempotent(v in arb_toml_value()) {
-                let plist_val = toml_to_plist(&v).unwrap();
-                if let plist::Value::Dictionary(dict) = &plist_val {
+                let pv = toml_to_plist(&v).unwrap();
+                if let plist::Value::Dictionary(dict) = &*pv {
                     let mut base = dict.clone();
                     deep_merge_plist(&mut base, dict);
                     prop_assert_eq!(&base, dict);

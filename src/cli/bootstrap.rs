@@ -10,7 +10,7 @@ use super::system::{install, status, upgrade, r#use};
 use crate::config::{self, Config, Settings};
 use crate::dirs;
 use crate::system;
-use crate::system::defaults::{DefaultsState, display_plist};
+use crate::system::defaults::DefaultsState;
 use crate::system::files::{FileMode, FileRequest};
 use crate::system::hooks::{self, BootstrapHookPhase};
 use crate::system::launchd::LaunchdState;
@@ -817,7 +817,7 @@ impl BootstrapMacosDefaultsStatus {
                         rows.push(vec![
                             req.domain.clone(),
                             req.key.clone(),
-                            display_plist(&req.value),
+                            req.value.to_string(),
                             "".to_string(),
                             format!("skipped ({reason})"),
                         ]);
@@ -828,7 +828,7 @@ impl BootstrapMacosDefaultsStatus {
                 let mut json_entries = vec![];
                 for s in statuses {
                     let (current, state) = match &s.state {
-                        DefaultsState::Set => (display_plist(&s.request.value), "set"),
+                        DefaultsState::Set => (s.request.value.to_string(), "set"),
                         DefaultsState::Differs { current } => {
                             any_missing = true;
                             (current.clone(), "differs")
@@ -850,7 +850,7 @@ impl BootstrapMacosDefaultsStatus {
                         rows.push(vec![
                             s.request.domain.clone(),
                             s.request.key.clone(),
-                            display_plist(&s.request.value),
+                            s.request.value.to_string(),
                             current,
                             state.to_string(),
                         ]);
