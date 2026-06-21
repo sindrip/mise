@@ -1,10 +1,10 @@
 //! macOS user defaults (preferences) for the `[bootstrap.macos.defaults]` config section.
 //!
-//! Entries are written with `defaults write <domain> <key> <-type> <value>`
-//! and checked with `defaults read-type`/`defaults read`. Like
-//! `[bootstrap.packages]` they are machine-global, declarative, and only ever
-//! applied when explicitly requested with `mise bootstrap macos-defaults apply`
-//! or `mise bootstrap`.
+//! Values are applied via `defaults export`/`defaults import` round-trips:
+//! export the current plist, deep-merge declared values, import back.
+//! Like `[bootstrap.packages]` they are machine-global, declarative, and
+//! only ever applied when explicitly requested with
+//! `mise bootstrap macos-defaults apply` or `mise bootstrap`.
 
 use std::io::Cursor;
 use std::process::Stdio;
@@ -28,9 +28,7 @@ impl std::fmt::Display for DefaultsRequest {
     }
 }
 
-/// The value types `defaults write` can set and mise can verify. Other plist
-/// types (arrays, dicts, dates, data) are not supported — config entries with
-/// those TOML types warn and are skipped.
+/// Supported TOML value types. Maps to plist types for export/import.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DefaultsValue {
     Bool(bool),
@@ -63,23 +61,6 @@ impl DefaultsValue {
         }
     }
 
-    /// type+value arguments for `defaults write <domain> <key> ...`
-    /// Returns `None` for nested values (Dict/Array) which use the
-    /// export/import path instead.
-    pub fn write_args(&self) -> Option<Vec<String>> {
-        match self {
-            Self::Bool(b) => Some(vec!["-bool".into(), b.to_string()]),
-            Self::Int(i) => Some(vec!["-int".into(), i.to_string()]),
-            Self::Float(f) => Some(vec!["-float".into(), f.to_string()]),
-            Self::Str(s) => Some(vec!["-string".into(), s.clone()]),
-            Self::Dict(_) | Self::Array(_) => None,
-        }
-    }
-
-    pub fn is_nested(&self) -> bool {
-        matches!(self, Self::Dict(_) | Self::Array(_))
-    }
-
     pub fn to_json(&self) -> serde_json::Value {
         match self {
             Self::Bool(b) => (*b).into(),
@@ -94,23 +75,6 @@ impl DefaultsValue {
             Self::Array(items) => {
                 serde_json::Value::Array(items.iter().map(|v| v.to_json()).collect())
             }
-        }
-    }
-
-    /// Does the pair from `defaults read-type` ("boolean", "integer", ...)
-    /// and `defaults read` (raw value; booleans print as 1/0) match this
-    /// value? Types are compared strictly: an integer 1 does not satisfy a
-    /// configured `true` — `mise bootstrap macos-defaults apply` converges it to the typed
-    /// value.
-    fn matches(&self, read_type: &str, raw: &str) -> bool {
-        match self {
-            Self::Bool(b) => read_type == "boolean" && raw == if *b { "1" } else { "0" },
-            Self::Int(i) => read_type == "integer" && raw.parse::<i64>() == Ok(*i),
-            Self::Float(f) => {
-                read_type == "float" && raw.parse::<f64>().is_ok_and(|v| (v - f).abs() < 1e-9)
-            }
-            Self::Str(s) => read_type == "string" && raw == s,
-            Self::Dict(_) | Self::Array(_) => false,
         }
     }
 }
@@ -271,57 +235,28 @@ pub fn unavailable_reason() -> String {
 pub async fn status(requests: &[DefaultsRequest]) -> Result<Vec<DefaultsStatus>> {
     let mut out = vec![];
 
-    let has_nested: IndexMap<&str, bool> = {
-        let mut m = IndexMap::new();
-        for req in requests {
-            let entry = m.entry(req.domain.as_str()).or_insert(false);
-            if req.value.is_nested() {
-                *entry = true;
-            }
-        }
-        m
-    };
-
     let mut domain_exports: IndexMap<String, Option<plist::Dictionary>> = IndexMap::new();
-    for (domain, nested) in &has_nested {
-        if *nested {
-            domain_exports.insert(domain.to_string(), export_domain(domain).await?);
+    for req in requests {
+        if !domain_exports.contains_key(&req.domain) {
+            domain_exports.insert(req.domain.clone(), export_domain(&req.domain).await?);
         }
     }
 
     for req in requests {
-        let state = if has_nested.get(req.domain.as_str()).copied().unwrap_or(false) {
-            let exported = domain_exports.get(&req.domain).and_then(|d| d.as_ref());
-            match exported.and_then(|dict| dict.get(&req.key)) {
-                Some(current_plist) => {
-                    let declared_plist = req.value.to_plist();
-                    if plist_contains(current_plist, &declared_plist) {
-                        DefaultsState::Set
-                    } else {
-                        let current = DefaultsValue::from_plist(current_plist)
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "(unsupported plist type)".to_string());
-                        DefaultsState::Differs { current }
-                    }
+        let exported = domain_exports.get(&req.domain).and_then(|d| d.as_ref());
+        let state = match exported.and_then(|dict| dict.get(&req.key)) {
+            Some(current_plist) => {
+                let declared_plist = req.value.to_plist();
+                if plist_contains(current_plist, &declared_plist) {
+                    DefaultsState::Set
+                } else {
+                    let current = DefaultsValue::from_plist(current_plist)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "(unsupported plist type)".to_string());
+                    DefaultsState::Differs { current }
                 }
-                None => DefaultsState::Unset,
             }
-        } else {
-            match read(&req.domain, &req.key).await? {
-                Some((read_type, raw)) => {
-                    if req.value.matches(&read_type, &raw) {
-                        DefaultsState::Set
-                    } else {
-                        let current = if raw == req.value.to_string() {
-                            format!("{raw} ({read_type})")
-                        } else {
-                            raw
-                        };
-                        DefaultsState::Differs { current }
-                    }
-                }
-                None => DefaultsState::Unset,
-            }
+            None => DefaultsState::Unset,
         };
         out.push(DefaultsStatus {
             request: req.clone(),
@@ -333,53 +268,17 @@ pub async fn status(requests: &[DefaultsRequest]) -> Result<Vec<DefaultsStatus>>
 
 /// Write the given entries (already filtered to unset/differing ones)
 pub async fn apply(requests: &[DefaultsRequest], dry_run: bool) -> Result<()> {
-    let has_nested: IndexMap<&str, bool> = {
-        let mut m = IndexMap::new();
-        for req in requests {
-            let entry = m.entry(req.domain.as_str()).or_insert(false);
-            if req.value.is_nested() {
-                *entry = true;
-            }
-        }
-        m
-    };
-
-    // Domains with any nested values use export/merge/import
-    let mut nested_domains: IndexMap<String, Vec<&DefaultsRequest>> = IndexMap::new();
-
+    let mut by_domain: IndexMap<String, Vec<&DefaultsRequest>> = IndexMap::new();
     for req in requests {
-        if has_nested.get(req.domain.as_str()).copied().unwrap_or(false) {
-            nested_domains
-                .entry(req.domain.clone())
-                .or_default()
-                .push(req);
-            continue;
-        }
-        let args = req.value.write_args().expect("scalar value has write_args");
-        let mut cmd_args = vec!["write".to_string(), req.domain.clone(), req.key.clone()];
-        cmd_args.extend(args);
-        let display = shell_words::join(&cmd_args);
-        if dry_run {
-            miseprintln!("defaults {display}");
-            continue;
-        }
-        debug!("$ defaults {display}");
-        let output = tokio::process::Command::new("defaults")
-            .args(&cmd_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?;
-        if !output.status.success() {
-            eyre::bail!(
-                "`defaults {display}` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+        by_domain.entry(req.domain.clone()).or_default().push(req);
     }
 
-    for (domain, reqs) in &nested_domains {
+    for (domain, reqs) in &by_domain {
+        if dry_run {
+            let keys: Vec<_> = reqs.iter().map(|r| format!("{} = {}", r.key, r.value)).collect();
+            miseprintln!("defaults import {domain} (merge {})", keys.join(", "));
+            continue;
+        }
         let mut dict = export_domain(domain).await?.unwrap_or_default();
         for req in reqs {
             let plist_val = req.value.to_plist();
@@ -395,62 +294,10 @@ pub async fn apply(requests: &[DefaultsRequest], dry_run: bool) -> Result<()> {
                 }
             }
         }
-        if dry_run {
-            let keys: Vec<_> = reqs.iter().map(|r| format!("{} = {}", r.key, r.value)).collect();
-            miseprintln!("defaults import {domain} (merge {})", keys.join(", "));
-            continue;
-        }
         debug!("$ defaults import {domain} -");
         import_domain(domain, &dict).await?;
     }
     Ok(())
-}
-
-/// `defaults read-type` + `defaults read` for one key. Returns
-/// `(type, raw value)`, or None when the key (or domain) does not exist —
-/// both commands exit non-zero for that, which is not an error here.
-async fn read(domain: &str, key: &str) -> Result<Option<(String, String)>> {
-    let Some(read_type) = defaults_cmd(&["read-type", domain, key]).await? else {
-        return Ok(None);
-    };
-    // "Type is boolean" -> "boolean"
-    let read_type = read_type
-        .strip_prefix("Type is ")
-        .unwrap_or(&read_type)
-        .to_string();
-    let Some(raw) = defaults_cmd(&["read", domain, key]).await? else {
-        return Ok(None);
-    };
-    Ok(Some((read_type, raw)))
-}
-
-async fn defaults_cmd(args: &[&str]) -> Result<Option<String>> {
-    debug!("$ defaults {}", shell_words::join(args));
-    let output = tokio::process::Command::new("defaults")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    if !output.status.success() {
-        // "does not exist" is the expected missing-key/-domain answer; any
-        // other failure (cfprefsd unavailable, managed domain, ...) must not
-        // masquerade as Unset
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("does not exist") {
-            return Ok(None);
-        }
-        eyre::bail!(
-            "`defaults {}` failed: {}",
-            shell_words::join(args),
-            stderr.trim()
-        );
-    }
-    // strip only the trailing newline — leading/trailing spaces can be
-    // significant in string values
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(Some(stdout.trim_end_matches(['\r', '\n']).to_string()))
 }
 
 #[cfg(test)]
@@ -516,60 +363,6 @@ mod tests {
                 )])),
             )]))
         );
-    }
-
-    #[test]
-    fn test_write_args() {
-        assert_eq!(
-            DefaultsValue::Bool(true).write_args(),
-            Some(vec!["-bool".to_string(), "true".to_string()])
-        );
-        assert_eq!(
-            DefaultsValue::Bool(false).write_args(),
-            Some(vec!["-bool".to_string(), "false".to_string()])
-        );
-        assert_eq!(
-            DefaultsValue::Int(2).write_args(),
-            Some(vec!["-int".to_string(), "2".to_string()])
-        );
-        assert_eq!(
-            DefaultsValue::Float(0.5).write_args(),
-            Some(vec!["-float".to_string(), "0.5".to_string()])
-        );
-        assert_eq!(
-            DefaultsValue::Str("left".into()).write_args(),
-            Some(vec!["-string".to_string(), "left".to_string()])
-        );
-        assert_eq!(
-            DefaultsValue::Dict(IndexMap::new()).write_args(),
-            None
-        );
-        assert_eq!(DefaultsValue::Array(vec![]).write_args(), None);
-    }
-
-    #[test]
-    fn test_matches() {
-        // booleans read back as 1/0
-        assert!(DefaultsValue::Bool(true).matches("boolean", "1"));
-        assert!(DefaultsValue::Bool(false).matches("boolean", "0"));
-        assert!(!DefaultsValue::Bool(true).matches("boolean", "0"));
-        // strict typing: integer 1 does not satisfy `true`
-        assert!(!DefaultsValue::Bool(true).matches("integer", "1"));
-
-        assert!(DefaultsValue::Int(2).matches("integer", "2"));
-        assert!(!DefaultsValue::Int(2).matches("integer", "3"));
-        assert!(!DefaultsValue::Int(2).matches("float", "2"));
-
-        // `defaults read` may print floats without a fraction
-        assert!(DefaultsValue::Float(48.0).matches("float", "48"));
-        assert!(DefaultsValue::Float(0.5).matches("float", "0.5"));
-        assert!(!DefaultsValue::Float(0.5).matches("float", "0.6"));
-
-        assert!(DefaultsValue::Str("left".into()).matches("string", "left"));
-        assert!(!DefaultsValue::Str("left".into()).matches("string", "right"));
-
-        // nested values always return false (use plist path)
-        assert!(!DefaultsValue::Dict(IndexMap::new()).matches("dictionary", "{}"));
     }
 
     #[test]
