@@ -307,7 +307,7 @@ pub fn defaults_from_config(config: &Config) -> Vec<DefaultsRequest> {
     }
     let mut out = vec![];
     for ((domain, key), value) in merged {
-        match DefaultsValue::toml_to_plist(&value) {
+        match DefaultsValue::from_toml(&value) {
             Some(value) => out.push(DefaultsRequest { domain, key, value }),
             None => warn!(
                 "[bootstrap.macos.defaults]: unsupported TOML type for {domain} {key} (datetime)"
