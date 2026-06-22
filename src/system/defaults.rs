@@ -7,34 +7,48 @@
 //! `mise bootstrap macos-defaults apply` or `mise bootstrap`.
 
 use std::io::Cursor;
-use std::ops::Deref;
 use std::process::Stdio;
 
 use indexmap::IndexMap;
 
 use crate::result::Result;
 
-/// Newtype around `plist::Value` so we can implement `Display`.
+/// Newtype around `plist::Value` for macOS defaults-specific display/serde behavior.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
-pub struct PlistValue(pub plist::Value);
+pub struct DefaultsValue {
+    plist: plist::Value,
+}
 
-impl Deref for PlistValue {
-    type Target = plist::Value;
-    fn deref(&self) -> &plist::Value {
-        &self.0
+impl From<plist::Value> for DefaultsValue {
+    fn from(plist: plist::Value) -> Self {
+        Self { plist }
     }
 }
 
-impl From<plist::Value> for PlistValue {
-    fn from(v: plist::Value) -> Self {
-        Self(v)
+impl DefaultsValue {
+    /// Convert a TOML value to a plist value via serde.
+    /// Returns `None` for TOML datetimes.
+    pub fn toml_to_plist(value: &toml::Value) -> Option<Self> {
+        if Self::contains_datetime(value) {
+            return None;
+        }
+        plist::to_value(value).ok().map(Self::from)
+    }
+
+    fn contains_datetime(value: &toml::Value) -> bool {
+        match value {
+            toml::Value::Datetime(_) => true,
+            toml::Value::Array(values) => values.iter().any(Self::contains_datetime),
+            toml::Value::Table(table) => table.values().any(Self::contains_datetime),
+            _ => false,
+        }
     }
 }
 
-impl std::fmt::Display for PlistValue {
+impl std::fmt::Display for DefaultsValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.0 {
+        match &self.plist {
             plist::Value::Boolean(b) => write!(f, "{b}"),
             plist::Value::Integer(i) => match i.as_signed() {
                 Some(v) => write!(f, "{v}"),
@@ -55,30 +69,12 @@ pub struct DefaultsRequest {
     /// preferences domain, e.g. "com.apple.dock" or "NSGlobalDomain"
     pub domain: String,
     pub key: String,
-    pub value: PlistValue,
+    pub value: DefaultsValue,
 }
 
 impl std::fmt::Display for DefaultsRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {} = {}", self.domain, self.key, self.value)
-    }
-}
-
-/// Convert a TOML value to a plist value via serde.
-/// Returns `None` for TOML datetimes.
-pub fn toml_to_plist(value: &toml::Value) -> Option<PlistValue> {
-    if contains_datetime(value) {
-        return None;
-    }
-    plist::to_value(value).ok().map(PlistValue)
-}
-
-fn contains_datetime(value: &toml::Value) -> bool {
-    match value {
-        toml::Value::Datetime(_) => true,
-        toml::Value::Array(values) => values.iter().any(contains_datetime),
-        toml::Value::Table(table) => table.values().any(contains_datetime),
-        _ => false,
     }
 }
 
@@ -143,10 +139,9 @@ async fn import_domain(domain: &str, dict: &plist::Dictionary) -> Result<()> {
 /// For scalars and arrays, values must match exactly.
 fn plist_contains(current: &plist::Value, declared: &plist::Value) -> bool {
     match (current, declared) {
-        (plist::Value::Dictionary(cur), plist::Value::Dictionary(decl)) => {
-            decl.iter()
-                .all(|(k, v)| cur.get(k).is_some_and(|cv| plist_contains(cv, v)))
-        }
+        (plist::Value::Dictionary(cur), plist::Value::Dictionary(decl)) => decl
+            .iter()
+            .all(|(k, v)| cur.get(k).is_some_and(|cv| plist_contains(cv, v))),
         _ => current == declared,
     }
 }
@@ -194,11 +189,11 @@ pub async fn status(requests: &[DefaultsRequest]) -> Result<Vec<DefaultsStatus>>
         let exported = domain_exports.get(&req.domain).and_then(|d| d.as_ref());
         let state = match exported.and_then(|dict| dict.get(&req.key)) {
             Some(current_plist) => {
-                if plist_contains(current_plist, &req.value) {
+                if plist_contains(current_plist, &req.value.plist) {
                     DefaultsState::Set
                 } else {
                     DefaultsState::Differs {
-                        current: PlistValue(current_plist.clone()).to_string(),
+                        current: DefaultsValue::from(current_plist.clone()).to_string(),
                     }
                 }
             }
@@ -230,15 +225,12 @@ pub async fn apply(requests: &[DefaultsRequest], dry_run: bool) -> Result<()> {
         }
         let mut dict = export_domain(domain).await?.unwrap_or_default();
         for req in reqs {
-            match (&req.value.0, dict.get_mut(&req.key)) {
-                (
-                    plist::Value::Dictionary(overlay),
-                    Some(plist::Value::Dictionary(existing)),
-                ) => {
+            match (&req.value.plist, dict.get_mut(&req.key)) {
+                (plist::Value::Dictionary(overlay), Some(plist::Value::Dictionary(existing))) => {
                     deep_merge_plist(existing, overlay);
                 }
                 _ => {
-                    dict.insert(req.key.clone(), req.value.0.clone());
+                    dict.insert(req.key.clone(), req.value.plist.clone());
                 }
             }
         }
@@ -259,23 +251,23 @@ mod tests {
     #[test]
     fn test_toml_to_plist() {
         assert_eq!(
-            toml_to_plist(&val("true")),
+            DefaultsValue::toml_to_plist(&val("true")),
             Some(plist::Value::Boolean(true).into())
         );
         assert_eq!(
-            toml_to_plist(&val("48")),
+            DefaultsValue::toml_to_plist(&val("48")),
             Some(plist::Value::Integer(48.into()).into())
         );
         assert_eq!(
-            toml_to_plist(&val("1.5")),
+            DefaultsValue::toml_to_plist(&val("1.5")),
             Some(plist::Value::Real(1.5).into())
         );
         assert_eq!(
-            toml_to_plist(&val(r#""right""#)),
+            DefaultsValue::toml_to_plist(&val(r#""right""#)),
             Some(plist::Value::String("right".into()).into())
         );
         assert_eq!(
-            toml_to_plist(&val("[1, 2]")),
+            DefaultsValue::toml_to_plist(&val("[1, 2]")),
             Some(
                 plist::Value::Array(vec![
                     plist::Value::Integer(1.into()),
@@ -285,8 +277,8 @@ mod tests {
             )
         );
 
-        let pv = toml_to_plist(&val("{ a = 1 }")).unwrap();
-        let inner = match &*pv {
+        let pv = DefaultsValue::toml_to_plist(&val("{ a = 1 }")).unwrap();
+        let inner = match &pv.plist {
             plist::Value::Dictionary(d) => d,
             _ => panic!("expected dict"),
         };
@@ -302,8 +294,8 @@ mod tests {
             "#,
         )
         .unwrap();
-        let pv = toml_to_plist(&toml).unwrap();
-        let outer = match &*pv {
+        let pv = DefaultsValue::toml_to_plist(&toml).unwrap();
+        let outer = match &pv.plist {
             plist::Value::Dictionary(d) => d,
             _ => panic!("expected dict"),
         };
@@ -316,16 +308,22 @@ mod tests {
 
     #[test]
     fn test_toml_to_plist_rejects_datetime() {
-        assert_eq!(toml_to_plist(&val("2024-01-01T00:00:00Z")), None);
+        assert_eq!(
+            DefaultsValue::toml_to_plist(&val("2024-01-01T00:00:00Z")),
+            None
+        );
     }
 
     #[test]
     fn test_toml_to_plist_rejects_nested_datetime() {
         assert_eq!(
-            toml_to_plist(&val("{ updated_at = 2024-01-01T00:00:00Z }")),
+            DefaultsValue::toml_to_plist(&val("{ updated_at = 2024-01-01T00:00:00Z }")),
             None
         );
-        assert_eq!(toml_to_plist(&val("[2024-01-01T00:00:00Z]")), None);
+        assert_eq!(
+            DefaultsValue::toml_to_plist(&val("[2024-01-01T00:00:00Z]")),
+            None
+        );
     }
 
     #[test]
@@ -388,8 +386,7 @@ mod tests {
             };
             leaf.prop_recursive(3, 16, 4, |inner| {
                 prop_oneof![
-                    prop::collection::vec(inner.clone(), 0..4)
-                        .prop_map(toml::Value::Array),
+                    prop::collection::vec(inner.clone(), 0..4).prop_map(toml::Value::Array),
                     prop::collection::btree_map("[a-z]{1,4}", inner, 0..4)
                         .prop_map(|m| toml::Value::Table(m.into_iter().collect())),
                 ]
@@ -404,20 +401,23 @@ mod tests {
         }
 
         proptest! {
-            /// toml_to_plist rejects exactly the TOML trees that contain a datetime
+            /// `DefaultsValue::toml_to_plist` rejects exactly the TOML trees that contain a datetime
             #[test]
-            fn toml_to_plist_rejects_datetimes(v in arb_toml_value(true)) {
-                prop_assert_eq!(toml_to_plist(&v).is_none(), contains_datetime(&v));
+            fn defaults_value_toml_to_plist_rejects_datetimes(v in arb_toml_value(true)) {
+                prop_assert_eq!(
+                    DefaultsValue::toml_to_plist(&v).is_none(),
+                    DefaultsValue::contains_datetime(&v),
+                );
             }
 
             /// deep merging a dict always makes the overlay visible in the result
             #[test]
             fn deep_merge_contains_overlay(base in arb_toml_table(), overlay in arb_toml_table()) {
-                let mut base = match toml_to_plist(&base).unwrap().0 {
+                let mut base = match DefaultsValue::toml_to_plist(&base).unwrap().plist {
                     plist::Value::Dictionary(dict) => dict,
                     _ => unreachable!("arb_toml_table always generates tables"),
                 };
-                let overlay = match toml_to_plist(&overlay).unwrap().0 {
+                let overlay = match DefaultsValue::toml_to_plist(&overlay).unwrap().plist {
                     plist::Value::Dictionary(dict) => dict,
                     _ => unreachable!("arb_toml_table always generates tables"),
                 };
