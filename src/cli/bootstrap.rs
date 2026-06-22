@@ -831,7 +831,7 @@ impl BootstrapMacosDefaultsStatus {
                         DefaultsState::Set => (s.request.value.to_string(), "set"),
                         DefaultsState::Differs { current } => {
                             any_missing = true;
-                            (current.clone(), "differs")
+                            (current.to_string(), "differs")
                         }
                         DefaultsState::Unset => {
                             any_missing = true;

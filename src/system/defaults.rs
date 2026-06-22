@@ -1,7 +1,7 @@
 //! macOS user defaults (preferences) for the `[bootstrap.macos.defaults]` config section.
 //!
-//! Entries are written with `defaults write <domain> <key> <-type> <value>`
-//! and checked with `defaults read-type`/`defaults read`. Like
+//! Current state is read with `defaults export` (plist serde) and changes are
+//! written with `defaults export` → merge → `defaults import`. Like
 //! `[bootstrap.packages]` they are machine-global, declarative, and only ever
 //! applied when explicitly requested with `mise bootstrap macos-defaults apply`
 //! or `mise bootstrap`.
@@ -51,12 +51,24 @@ impl TryFrom<&toml::Value> for DefaultsValue {
 }
 
 impl DefaultsValue {
-    pub fn write_args(&self) -> Vec<String> {
-        todo!("replaced by defaults import")
-    }
-
-    fn matches(&self, _read_type: &str, _raw: &str) -> bool {
-        todo!("replaced by defaults export")
+    /// RFC 7396 JSON Merge Patch semantics: dicts merge recursively,
+    /// everything else (including arrays) is replaced.
+    pub fn merge(&mut self, patch: DefaultsValue) {
+        match (self, patch) {
+            (Self::Dict(current), Self::Dict(patch)) => {
+                for (key, value) in patch {
+                    match current.get_mut(&key) {
+                        Some(existing) => existing.merge(value),
+                        None => {
+                            current.insert(key, value);
+                        }
+                    }
+                }
+            }
+            (this, patch) => {
+                *this = patch;
+            }
+        }
     }
 }
 
@@ -82,7 +94,7 @@ pub enum DefaultsState {
     /// current value matches the config
     Set,
     /// a value exists but differs from the config (in value or type)
-    Differs { current: String },
+    Differs { current: DefaultsValue },
     /// the key is not set in this domain
     Unset,
 }
@@ -109,23 +121,23 @@ pub fn unavailable_reason() -> String {
 pub async fn status(requests: &[DefaultsRequest]) -> Result<Vec<DefaultsStatus>> {
     let mut out = vec![];
     for req in requests {
-        let state = match read(&req.domain, &req.key).await? {
-            Some((read_type, raw)) => {
-                if req.value.matches(&read_type, &raw) {
+        let current = export_domain(&req.domain)
+            .await?
+            .and_then(|map| map.get(&req.key).cloned());
+
+        let state = match current {
+            None => DefaultsState::Unset,
+            Some(current) => {
+                let mut merged = current.clone();
+                merged.merge(req.value.clone());
+                if merged == current {
                     DefaultsState::Set
                 } else {
-                    // call out a type mismatch when the raw value alone
-                    // would look identical to the configured one
-                    let current = if raw == req.value.to_string() {
-                        format!("{raw} ({read_type})")
-                    } else {
-                        raw
-                    };
                     DefaultsState::Differs { current }
                 }
             }
-            None => DefaultsState::Unset,
         };
+
         out.push(DefaultsStatus {
             request: req.clone(),
             state,
@@ -134,81 +146,91 @@ pub async fn status(requests: &[DefaultsRequest]) -> Result<Vec<DefaultsStatus>>
     Ok(out)
 }
 
-/// Write the given entries (already filtered to unset/differing ones)
+/// Write the given entries (already filtered to unset/differing ones).
+/// Uses `defaults export` → merge → `defaults import` per request.
+/// The read-modify-write cycle is non-atomic; the race window is
+/// negligible for an interactive bootstrap tool.
 pub async fn apply(requests: &[DefaultsRequest], dry_run: bool) -> Result<()> {
     for req in requests {
-        let mut args = vec!["write".to_string(), req.domain.clone(), req.key.clone()];
-        args.extend(req.value.write_args());
-        // shell-quoted so the printed command is copy-pasteable even when a
-        // string value contains spaces
-        let display = shell_words::join(&args);
+        let current = export_domain(&req.domain).await?;
+
         if dry_run {
-            miseprintln!("defaults {display}");
+            let display_current = current
+                .as_ref()
+                .and_then(|m| m.get(&req.key))
+                .map_or("unset".to_string(), |v| v.to_string());
+
+            miseprintln!(
+                "{} {}: {} → {}",
+                req.domain,
+                req.key,
+                display_current,
+                req.value
+            );
+
             continue;
         }
-        debug!("$ defaults {display}");
-        let output = tokio::process::Command::new("defaults")
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?;
-        if !output.status.success() {
-            eyre::bail!(
-                "`defaults {display}` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        let mut merged = current.unwrap_or_default();
+        match merged.get_mut(&req.key) {
+            Some(existing) => existing.merge(req.value.clone()),
+            None => {
+                merged.insert(req.key.clone(), req.value.clone());
+            }
         }
+        debug!("defaults import {} (setting {})", req.domain, req.key);
+        import_domain(&req.domain, &merged).await?;
     }
     Ok(())
 }
 
-/// `defaults read-type` + `defaults read` for one key. Returns
-/// `(type, raw value)`, or None when the key (or domain) does not exist —
-/// both commands exit non-zero for that, which is not an error here.
-async fn read(domain: &str, key: &str) -> Result<Option<(String, String)>> {
-    let Some(read_type) = defaults_cmd(&["read-type", domain, key]).await? else {
-        return Ok(None);
-    };
-    // "Type is boolean" -> "boolean"
-    let read_type = read_type
-        .strip_prefix("Type is ")
-        .unwrap_or(&read_type)
-        .to_string();
-    let Some(raw) = defaults_cmd(&["read", domain, key]).await? else {
-        return Ok(None);
-    };
-    Ok(Some((read_type, raw)))
-}
-
-async fn defaults_cmd(args: &[&str]) -> Result<Option<String>> {
-    debug!("$ defaults {}", shell_words::join(args));
+/// Export all keys for a domain via `defaults export <domain> -`.
+/// Returns `None` when the domain does not exist.
+async fn export_domain(domain: &str) -> Result<Option<IndexMap<String, DefaultsValue>>> {
+    debug!("$ defaults export {domain} -");
     let output = tokio::process::Command::new("defaults")
-        .args(args)
+        .args(["export", domain, "-"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await?;
+
     if !output.status.success() {
-        // "does not exist" is the expected missing-key/-domain answer; any
-        // other failure (cfprefsd unavailable, managed domain, ...) must not
-        // masquerade as Unset
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("does not exist") {
             return Ok(None);
         }
+        eyre::bail!("`defaults export {domain} -` failed: {}", stderr.trim());
+    }
+
+    let map = plist::from_reader(std::io::Cursor::new(&output.stdout))?;
+    Ok(Some(map))
+}
+
+/// Import a full domain via `defaults import <domain> -`.
+async fn import_domain(domain: &str, entries: &IndexMap<String, DefaultsValue>) -> Result<()> {
+    let mut plist_bytes = vec![];
+    plist::to_writer_xml(&mut plist_bytes, entries)?;
+    let mut child = tokio::process::Command::new("defaults")
+        .args(["import", domain, "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        tokio::io::AsyncWriteExt::write_all(&mut stdin, &plist_bytes).await?;
+    }
+
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
         eyre::bail!(
-            "`defaults {}` failed: {}",
-            shell_words::join(args),
-            stderr.trim()
+            "`defaults import {domain} -` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    // strip only the trailing newline — leading/trailing spaces can be
-    // significant in string values
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(Some(stdout.trim_end_matches(['\r', '\n']).to_string()))
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -244,6 +266,82 @@ mod tests {
         assert_eq!(
             DefaultsValue::try_from(&val("{ a = 1 }")).unwrap(),
             DefaultsValue::Dict(IndexMap::from([("a".into(), DefaultsValue::Int(1))]))
+        );
+    }
+
+    #[test]
+    fn test_deep_merge_dict() {
+        let mut current = DefaultsValue::Dict(IndexMap::from([
+            ("a".into(), DefaultsValue::Int(1)),
+            ("b".into(), DefaultsValue::Int(2)),
+            ("c".into(), DefaultsValue::Int(3)),
+            (
+                "nested".into(),
+                DefaultsValue::Dict(IndexMap::from([
+                    ("x".into(), DefaultsValue::Int(1)),
+                    ("y".into(), DefaultsValue::Int(2)),
+                ])),
+            ),
+        ]));
+        let patch = DefaultsValue::Dict(IndexMap::from([
+            ("a".into(), DefaultsValue::Int(99)),
+            (
+                "nested".into(),
+                DefaultsValue::Dict(IndexMap::from([("x".into(), DefaultsValue::Int(99))])),
+            ),
+        ]));
+        current.merge(patch);
+        assert_eq!(
+            current,
+            DefaultsValue::Dict(IndexMap::from([
+                ("a".into(), DefaultsValue::Int(99)),
+                ("b".into(), DefaultsValue::Int(2)),
+                ("c".into(), DefaultsValue::Int(3)),
+                (
+                    "nested".into(),
+                    DefaultsValue::Dict(IndexMap::from([
+                        ("x".into(), DefaultsValue::Int(99)),
+                        ("y".into(), DefaultsValue::Int(2)),
+                    ])),
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_comparison() {
+        let current = DefaultsValue::Dict(IndexMap::from([
+            ("a".into(), DefaultsValue::Int(1)),
+            ("b".into(), DefaultsValue::Int(2)),
+            ("c".into(), DefaultsValue::Int(3)),
+        ]));
+
+        // partial config — all specified keys match
+        let desired = DefaultsValue::Dict(IndexMap::from([("a".into(), DefaultsValue::Int(1))]));
+        let mut merged = current.clone();
+        merged.merge(desired);
+        assert_eq!(merged, current, "extra keys should not cause a diff");
+
+        // partial config — one key differs
+        let desired =
+            DefaultsValue::Dict(IndexMap::from([("a".into(), DefaultsValue::Int(99))]));
+        let mut merged = current.clone();
+        merged.merge(desired);
+        assert_ne!(merged, current, "changed key should cause a diff");
+    }
+
+    #[test]
+    fn test_merge_array_replaces() {
+        let mut current = DefaultsValue::Array(vec![
+            DefaultsValue::Int(1),
+            DefaultsValue::Int(2),
+            DefaultsValue::Int(3),
+        ]);
+        let patch = DefaultsValue::Array(vec![DefaultsValue::Int(4), DefaultsValue::Int(5)]);
+        current.merge(patch);
+        assert_eq!(
+            current,
+            DefaultsValue::Array(vec![DefaultsValue::Int(4), DefaultsValue::Int(5),])
         );
     }
 }
