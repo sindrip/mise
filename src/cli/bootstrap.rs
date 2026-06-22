@@ -842,7 +842,7 @@ impl BootstrapMacosDefaultsStatus {
                         json_entries.push(json!({
                             "domain": s.request.domain,
                             "key": s.request.key,
-                            "value": serde_json::to_value(&s.request.value).unwrap_or_default(),
+                            "value": serde_json::to_value(&s.request.value)?,
                             "current": current,
                             "state": state,
                         }));

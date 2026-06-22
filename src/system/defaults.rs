@@ -111,9 +111,9 @@ async fn export_domain(domain: &str) -> Result<Option<plist::Dictionary>> {
     }
 }
 
-async fn import_domain(domain: &str, dict: &plist::Dictionary) -> Result<()> {
+async fn import_domain(domain: &str, dict: plist::Dictionary) -> Result<()> {
     let mut xml = vec![];
-    plist::to_writer_xml(&mut xml, &plist::Value::Dictionary(dict.clone()))?;
+    plist::to_writer_xml(&mut xml, &plist::Value::Dictionary(dict))?;
     let mut child = tokio::process::Command::new("defaults")
         .args(["import", domain, "-"])
         .stdin(Stdio::piped())
@@ -223,18 +223,13 @@ pub async fn apply(requests: &[DefaultsRequest], dry_run: bool) -> Result<()> {
             continue;
         }
         let mut dict = export_domain(domain).await?.unwrap_or_default();
+        let mut overlay = plist::Dictionary::new();
         for req in reqs {
-            match (&req.value.plist, dict.get_mut(&req.key)) {
-                (plist::Value::Dictionary(overlay), Some(plist::Value::Dictionary(existing))) => {
-                    deep_merge_plist(existing, overlay);
-                }
-                _ => {
-                    dict.insert(req.key.clone(), req.value.plist.clone());
-                }
-            }
+            overlay.insert(req.key.clone(), req.value.plist.clone());
         }
+        deep_merge_plist(&mut dict, &overlay);
         debug!("$ defaults import {domain} -");
-        import_domain(domain, &dict).await?;
+        import_domain(domain, dict).await?;
     }
     Ok(())
 }
