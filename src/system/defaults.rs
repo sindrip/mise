@@ -150,7 +150,7 @@ pub enum DefaultsState {
     /// current value matches the config
     Set,
     /// a value exists but differs from the config (in value or type)
-    Differs { current: String },
+    Differs { current: DefaultsValue },
     /// the key is not set in this domain
     Unset,
 }
@@ -192,7 +192,7 @@ pub async fn status(requests: &[DefaultsRequest]) -> Result<Vec<DefaultsStatus>>
                     DefaultsState::Set
                 } else {
                     DefaultsState::Differs {
-                        current: DefaultsValue::from(current_plist.clone()).to_string(),
+                        current: DefaultsValue::from(current_plist.clone()),
                     }
                 }
             }

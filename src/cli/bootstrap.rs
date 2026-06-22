@@ -827,18 +827,20 @@ impl BootstrapMacosDefaultsStatus {
                 let statuses = system::defaults::status(&defaults).await?;
                 let mut json_entries = vec![];
                 for s in statuses {
-                    let (current, state) = match &s.state {
-                        DefaultsState::Set => (s.request.value.to_string(), "set"),
-                        DefaultsState::Differs { current } => {
-                            any_missing = true;
-                            (current.clone(), "differs")
-                        }
-                        DefaultsState::Unset => {
-                            any_missing = true;
-                            ("".to_string(), "unset")
-                        }
+                    let state = match &s.state {
+                        DefaultsState::Set => "set",
+                        DefaultsState::Differs { .. } => "differs",
+                        DefaultsState::Unset => "unset",
                     };
+                    if state != "set" {
+                        any_missing = true;
+                    }
                     if self.json {
+                        let current = match &s.state {
+                            DefaultsState::Set => serde_json::to_value(&s.request.value)?,
+                            DefaultsState::Differs { current } => serde_json::to_value(current)?,
+                            DefaultsState::Unset => serde_json::Value::Null,
+                        };
                         json_entries.push(json!({
                             "domain": s.request.domain,
                             "key": s.request.key,
@@ -847,6 +849,11 @@ impl BootstrapMacosDefaultsStatus {
                             "state": state,
                         }));
                     } else {
+                        let current = match &s.state {
+                            DefaultsState::Set => s.request.value.to_string(),
+                            DefaultsState::Differs { current } => current.to_string(),
+                            DefaultsState::Unset => "".to_string(),
+                        };
                         rows.push(vec![
                             s.request.domain.clone(),
                             s.request.key.clone(),
