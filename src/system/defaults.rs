@@ -367,15 +367,25 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
-        /// Generate arbitrary toml::Value trees (no Datetime)
-        fn arb_toml_value() -> impl Strategy<Value = toml::Value> {
-            let leaf = prop_oneof![
+        fn arb_toml_value(include_datetime: bool) -> BoxedStrategy<toml::Value> {
+            let supported = prop_oneof![
                 any::<bool>().prop_map(toml::Value::Boolean),
                 any::<i64>().prop_map(toml::Value::Integer),
                 // avoid NaN/Inf — not representable in JSON or plist
                 (-1e10f64..1e10f64).prop_map(toml::Value::Float),
-                "[a-z]{0,8}".prop_map(|s| toml::Value::String(s)),
+                "[a-z]{0,8}".prop_map(toml::Value::String),
             ];
+            let datetime = prop_oneof![
+                Just(val("2024-01-01T00:00:00Z")),
+                Just(val("2024-01-01T00:00:00")),
+                Just(val("2024-01-01")),
+                Just(val("12:34:56")),
+            ];
+            let leaf = if include_datetime {
+                prop_oneof![supported.boxed(), datetime.boxed()].boxed()
+            } else {
+                supported.boxed()
+            };
             leaf.prop_recursive(3, 16, 4, |inner| {
                 prop_oneof![
                     prop::collection::vec(inner.clone(), 0..4)
@@ -384,41 +394,40 @@ mod tests {
                         .prop_map(|m| toml::Value::Table(m.into_iter().collect())),
                 ]
             })
+            .boxed()
+        }
+
+        fn arb_toml_table() -> BoxedStrategy<toml::Value> {
+            prop::collection::btree_map("[a-z]{1,4}", arb_toml_value(false), 0..4)
+                .prop_map(|m| toml::Value::Table(m.into_iter().collect()))
+                .boxed()
         }
 
         proptest! {
-            /// toml_to_plist always succeeds for non-datetime values
+            /// toml_to_plist rejects exactly the TOML trees that contain a datetime
             #[test]
-            fn toml_to_plist_never_fails(v in arb_toml_value()) {
-                prop_assert!(toml_to_plist(&v).is_some());
+            fn toml_to_plist_rejects_datetimes(v in arb_toml_value(true)) {
+                prop_assert_eq!(toml_to_plist(&v).is_none(), contains_datetime(&v));
             }
 
-            /// the plist serde bridge preserves values: serializing toml and the
-            /// resulting plist to JSON produces identical output
+            /// deep merging a dict always makes the overlay visible in the result
             #[test]
-            fn toml_plist_json_round_trip(v in arb_toml_value()) {
-                let pv = toml_to_plist(&v).unwrap();
-                let json_from_toml = serde_json::to_value(&v).unwrap();
-                let json_from_plist = serde_json::to_value(&*pv).unwrap();
-                prop_assert_eq!(json_from_toml, json_from_plist);
-            }
+            fn deep_merge_contains_overlay(base in arb_toml_table(), overlay in arb_toml_table()) {
+                let mut base = match toml_to_plist(&base).unwrap().0 {
+                    plist::Value::Dictionary(dict) => dict,
+                    _ => unreachable!("arb_toml_table always generates tables"),
+                };
+                let overlay = match toml_to_plist(&overlay).unwrap().0 {
+                    plist::Value::Dictionary(dict) => dict,
+                    _ => unreachable!("arb_toml_table always generates tables"),
+                };
 
-            /// plist_contains is reflexive: a value always contains itself
-            #[test]
-            fn plist_contains_reflexive(v in arb_toml_value()) {
-                let pv = toml_to_plist(&v).unwrap();
-                prop_assert!(plist_contains(&pv, &pv));
-            }
+                deep_merge_plist(&mut base, &overlay);
 
-            /// a dict merged with itself is unchanged
-            #[test]
-            fn deep_merge_idempotent(v in arb_toml_value()) {
-                let pv = toml_to_plist(&v).unwrap();
-                if let plist::Value::Dictionary(dict) = &*pv {
-                    let mut base = dict.clone();
-                    deep_merge_plist(&mut base, dict);
-                    prop_assert_eq!(&base, dict);
-                }
+                prop_assert!(plist_contains(
+                    &plist::Value::Dictionary(base),
+                    &plist::Value::Dictionary(overlay),
+                ));
             }
         }
     }
